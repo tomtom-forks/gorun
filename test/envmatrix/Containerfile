@@ -1,0 +1,54 @@
+# Test environment for gorun's Go-environment handling (see go-env-review.md).
+#
+# Build from the repo root (the build context must include the gorun source):
+#   podman build -t gorun-envmatrix -f test/envmatrix/Containerfile .
+#
+# Run (rootful podman/docker recommended; network needed for module downloads):
+#   podman run --rm --tmpfs /tmp gorun-envmatrix
+#
+# Strict mode (non-zero exit on any failed check, for CI against a fixed gorun):
+#   podman run --rm --tmpfs /tmp -e STRICT=1 gorun-envmatrix
+
+FROM ubuntu:24.04
+
+# Default matches the version deployed on dev machines and production;
+# override with --build-arg GO_VERSION=... to test other toolchains.
+ARG GO_VERSION=1.24.2
+ARG TARGETARCH=amd64
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz" \
+    | tar -C /usr/local -xz
+ENV PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Build gorun from this repo with -trimpath (per README: keeps the build-time
+# GOROOT out of the binary so goBinaryPath() behaves as in production)
+COPY go.mod go.sum gorun.go /src/
+RUN cd /src && go build -trimpath -o /usr/local/bin/gorun .
+
+# The example environment config under review, and the shared GOPATH it refers to
+COPY example/linux/etc/profile.d/go.sh /etc/profile.d/go.sh
+RUN mkdir -p /usr/local/gopath
+
+# Test users:
+#   alice  - normal user with a home directory
+#   bob    - user whose home directory is read-only
+#   ghost  - passwd home path (/home/ghost) that does not exist
+#   nobody - pre-existing system user
+RUN useradd -m -s /bin/bash alice && \
+    useradd -m -s /bin/bash bob && chmod 555 /home/bob && \
+    useradd -M -d /home/ghost -s /bin/bash ghost
+
+# Test scripts:
+#   hello.go        - no external deps (exercises build cache only)
+#   myscript.go     - external deps, taken from the repo examples (module downloads)
+#   toolchain199.go - embedded go.mod requiring go 1.99.0 (toolchain auto-download)
+COPY example/linux/home/user/myscript/myscript.go /usr/local/bin/myscript.go
+COPY test/envmatrix/hello.go test/envmatrix/toolchain199.go /usr/local/bin/
+COPY test/envmatrix/run-matrix.sh /usr/local/bin/run-matrix.sh
+RUN chmod 644 /usr/local/bin/*.go && chmod 755 /usr/local/bin/run-matrix.sh
+
+CMD ["/usr/local/bin/run-matrix.sh"]
