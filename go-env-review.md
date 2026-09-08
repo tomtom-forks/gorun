@@ -39,8 +39,9 @@ exporting GOPATH (unnecessary since Go 1.8, and that export is what leaks).
 ## Changes
 
 These assume adoption of a root-owned, optional `/etc/gorun.conf` (see "Rationale and
-trade-offs" below). Precedence throughout: command-line flags > embedded `go.env`
-(per-script, repeatable) > `/etc/gorun.conf` (site policy) > built-in defaults.
+trade-offs" below). Precedence throughout: command-line flags (argv only — `GORUN_ARGS`
+values lose to the config, see decision 5) > embedded `go.env` (per-script, repeatable) >
+`/etc/gorun.conf` (site policy) > built-in defaults.
 
 1. **Add `/etc/gorun.conf` support to gorun.** Keys: `go_bin`, `cache_base`,
    `target_dir_base`, `clean_days`, and default build env settings (e.g. `GOTOOLCHAIN`,
@@ -73,8 +74,39 @@ trade-offs" below). Precedence throughout: command-line flags > embedded `go.env
    `[ -n "$HOME" ]`), and drop the `HOME=/root` fixup — another leak vector. Ship an
    example `/etc/gorun.conf` alongside it in `example/linux/etc/`.
 7. **Verify ownership/mode of `perUserTmpDir`** (the binary target area) before writing
-   or exec'ing anything under it — or move `target_dir_base` under `/var/cache/gorun` via
-   the config so it starts from a root-owned parent.
+   or exec'ing anything under it, **and** move `target_dir_base` under `/var/cache/gorun`
+   via the config so it starts from a root-owned parent (decision 6: both).
+
+## Implementation decisions (2026-09-08)
+
+1. **Config format:** flat `key=value`, parsed with a few lines of stdlib (no new
+   dependency); env defaults are ordinary keys, matching the syntax of the embedded
+   `go.env` sections.
+2. **Env passthrough:** the build env inherits the full `os.Environ()` — `GOPROXY`,
+   `GOPRIVATE`, `HTTP_PROXY`, `GOAUTH`, and `GOPATH` itself all pass through (GOPATH is
+   harmless once `GOMODCACHE` is forced). gorun force-overrides exactly four variables:
+   `GOCACHE`, `GOMODCACHE`, `GOTOOLCHAIN`, `GOENV` (each still overridable by the
+   embedded `go.env`).
+3. **Cache layout:** keyed by numeric uid — `/var/cache/gorun/<uid>/{gocache,gomod}`
+   with the config; on config-less machines the fallback folds into the existing
+   per-user dir: `/tmp/gorun-<host>-<uid>/{gocache,gomod}`.
+4. **Failure semantics:** hard error in both cases — a `/etc/gorun.conf` that exists but
+   is unparseable or insecurely owned/permissioned, and a per-uid cache dir failing the
+   ownership/mode check. Both are root-fixable; silent fallback is how the current mess
+   arose.
+5. **`GORUN_ARGS`:** still honoured, but "flags beat config" means *argv*, not
+   environment: genuine command-line flags override the config, while values arriving via
+   `GORUN_ARGS` lose to `/etc/gorun.conf` for keys the config also covers
+   (`targetDirBase`, `cleanDays`), with a warning on stderr.
+6. **Binary target area:** both halves of change 7 — `target_dir_base` defaults under
+   `/var/cache/gorun` via the config, *and* gorun verifies ownership/mode of the
+   per-user target dir regardless of where it points.
+
+Still open (operational, pre-rollout, not blocking implementation): audit deployed
+scripts' `go` directives against 1.24.2 before the `GOTOOLCHAIN=local` default lands;
+audit for `go env -w` settings scripts depend on before `GOENV=off`; choose a cache
+retention mechanism (`clean()` vs `tmpfiles.d` age rules); sanity-check `/var/cache`
+disk sizing.
 
 ## Scenarios
 
