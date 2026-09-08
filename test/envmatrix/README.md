@@ -23,14 +23,16 @@ Strict mode — exit non-zero on any failed check, for CI against a fixed gorun:
 ## Test cases
 
 The `[scenario N]` references are to the scenario numbering in
-`go-env-review.md`. "Current" is the result against the current gorun; every
-FAIL corresponds to a gap described in the review.
+`go-env-review.md`. The CHECK lines assert the *target* design from that review
+(the `/etc/gorun.conf` approach: deterministic gorun-managed caches, GOTOOLCHAIN
+local and GOENV off by default, configured `go_bin`). "Current" is the result
+against the current gorun; every FAIL corresponds to a gap versus that design.
 
 | Case | Description                                                                    | Review scenario | Current |
 |------|--------------------------------------------------------------------------------|-----------------|---------|
 | 01   | root, login shell (profile.d sourced)                                          | 2               | OK      |
 | 02   | alice (normal user), login shell, own home                                     | 1               | OK      |
-| 03   | alice, login shell, script with module downloads                               | 1               | OK      |
+| 03   | alice, login shell, script with module downloads                               | 1               | FAIL    |
 | 04   | INCIDENT: full root env (GOPATH, HOME) leaked to alice via daemon-style setuid | 3               | FAIL    |
 | 05   | INCIDENT variant: `su alice -c` without `-` (GOPATH leaks, su resets HOME)     | 3               | FAIL    |
 | 06   | nobody, HOME=/nonexistent                                                      | 4               | OK      |
@@ -42,8 +44,13 @@ FAIL corresponds to a gap described in the review.
 | 12   | minimal env (systemd/cron): stock PATH, no profile.d                           | 6               | FAIL    |
 | 13   | alice with leaked XDG_CACHE_HOME=/root/.cache                                  | 7               | FAIL    |
 | 14   | alice with leaked GOCACHE=/root/.cache/go-build                                | 7               | FAIL    |
-| 15   | embedded go.mod requires go 1.99.0 (GOTOOLCHAIN auto-download)                 | 8               | FAIL    |
+| 15   | embedded go.mod requires go 1.99.0 (default GOTOOLCHAIN behaviour)             | 8               | FAIL    |
 | 16   | /tmp squatting: alice pre-creates root's gorun directory                       | 9               | FAIL    |
+| 17   | alice with ~/.config/go/env setting GOPROXY=off                                | 7               | FAIL    |
+
+Note case 03: the script compiles and runs today, but the module cache lands in
+alice's home rather than the gorun-managed per-uid location the target design
+prescribes — the FAIL marks the cache *location*, not a broken build.
 
 ## Reading the output
 
@@ -51,8 +58,11 @@ Each case prints the command, exit status, the tail of its output, which cache
 directories gained files (and their owner), and `CHECK` lines asserting the
 *desired* behaviour.
 
-**CHECK FAILs against the current gorun are expected** — 8 at the time of
-writing, per the table above. A fixed gorun should reach 0.
+**CHECK FAILs against the current gorun are expected** — 10 at the time of
+writing, per the table above. A gorun implementing the `/etc/gorun.conf` design
+should reach 0. Once an example `/etc/gorun.conf` exists under `example/linux/etc/`,
+add it to the Containerfile so the matrix exercises the configured path as well
+as the built-in defaults.
 
 ## Notes
 

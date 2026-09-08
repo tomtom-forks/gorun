@@ -26,8 +26,8 @@ CASES=0
 # wipe all caches gorun/go could have written, so each case starts clean;
 # the marker lets us find everything written during the case
 reset() {
-    rm -rf /tmp/gorun-* /root/.cache /root/go \
-           /home/alice/.cache /home/alice/go /home/ghost
+    rm -rf /tmp/gorun-* /root/.cache /root/go /var/cache/gorun \
+           /home/alice/.cache /home/alice/.config /home/alice/go /home/ghost
     rm -rf /usr/local/gopath && mkdir /usr/local/gopath  # root-owned, as installed
     touch "$MARKER"
     sleep 1  # keep new mtimes strictly after the marker
@@ -50,7 +50,8 @@ run() {
 # list files created since the marker in the locations we care about
 wrote() {
     echo "  new files (owner, depth<=3):"
-    find /tmp/gorun-* /root/.cache /root/go /home/*/.cache /home/*/go /usr/local/gopath \
+    find /tmp/gorun-* /var/cache/gorun /root/.cache /root/go \
+         /home/*/.cache /home/*/go /usr/local/gopath \
          -maxdepth 3 -newer "$MARKER" -printf '    %u %p\n' 2>/dev/null | sort | head -15
 }
 
@@ -69,6 +70,26 @@ nothing_new_under() {
 }
 
 out_contains() { grep -qi -- "$1" <<<"$OUT"; }
+
+# target design (go-env-review.md): caches live in a gorun-managed per-uid dir,
+# <cache_base>/<uid>/{gocache,gomod} - /var/cache/gorun via /etc/gorun.conf,
+# or the built-in /tmp fallback
+gorun_managed_cache() {
+    find /var/cache/gorun /tmp/gorun-"$HOST"-* -maxdepth 2 -type d -name "$1" \
+         2>/dev/null | grep -q .
+}
+
+# every directory component above the given file must be root-owned
+# (stops at the known root-owned parents /tmp, /var/cache)
+path_owned_by_root() {
+    local p
+    [ -n "$1" ] || return 1
+    p=$(dirname "$1")
+    while [ "$p" != "/" ] && [ "$p" != "/tmp" ] && [ "$p" != "/var/cache" ]; do
+        [ "$(stat -c %U "$p" 2>/dev/null)" = root ] || return 1
+        p=$(dirname "$p")
+    done
+}
 
 # setpriv changes uid/gid but does NOT touch the environment - the faithful
 # reproduction of a daemon calling setuid() without cleaning its env
@@ -95,7 +116,8 @@ begin "03 alice, login shell, script with module downloads [scenario 1]"
 run su - alice -c "gorun $DEPS --help"
 wrote
 check "compiled and ran (--help exits 0)" [ "$RC" -eq 0 ]
-check "module cache under alice's home" test -d /home/alice/go/pkg/mod
+check "module cache in gorun-managed location (target behaviour after fix)" \
+      gorun_managed_cache gomod
 check "no writes to /usr/local/gopath" nothing_new_under /usr/local/gopath
 
 # --- scenario 3: root env leaking into a less privileged user ------------------
@@ -151,8 +173,8 @@ touch "$DEPS"
 t0=$SECONDS
 run as_nobody env HOME=/nonexistent gorun "$DEPS" --help
 echo "  recompile after touch: $((SECONDS - t0))s (current gorun re-downloads all modules here)"
-check "persistent per-user cache under /tmp/gorun-* (target behaviour after fix)" \
-      bash -c "find /tmp/gorun-$HOST-* -maxdepth 1 -type d \( -name 'gocache' -o -name 'gomod' \) 2>/dev/null | grep -q ."
+check "persistent gorun-managed module cache (target behaviour after fix)" \
+      gorun_managed_cache gomod
 
 # --- scenario 6: systemd/cron-style minimal environment ------------------------
 
@@ -176,7 +198,8 @@ check "no writes to /root" nothing_new_under /root
 # --- scenario 8: toolchain auto-download ----------------------------------------
 
 begin "15 embedded go.mod requires go 1.99.0 (GOTOOLCHAIN) [scenario 8]"
-run su - alice -c "GOTOOLCHAIN=auto gorun $TOOL"
+# no explicit GOTOOLCHAIN: exercises the default (target: GOTOOLCHAIN=local built in)
+run su - alice -c "gorun $TOOL"
 check "build failed (no go 1.99 exists)" [ "$RC" -ne 0 ]
 check "failed locally without a download attempt (target: GOTOOLCHAIN=local default)" \
       out_contains "GOTOOLCHAIN=local"
@@ -189,10 +212,19 @@ check "explicit GOTOOLCHAIN=local fails fast with a clear version error" \
 begin "16 /tmp squatting: alice pre-creates root's gorun directory [scenario 9]"
 su alice -c "mkdir -p /tmp/gorun-$HOST-0 && chmod 777 /tmp/gorun-$HOST-0"
 run gorun "$HELLO"
-echo "  /tmp/gorun-$HOST-0: $(stat -c 'owner %U, mode %a' "/tmp/gorun-$HOST-0")"
+BIN=$(find /tmp/gorun-* /var/cache/gorun -name '*.bin' -newer "$MARKER" 2>/dev/null | head -1)
+echo "  binary: ${BIN:-not found}"
 check "script ran" [ "$RC" -eq 0 ]
-check "root's gorun dir is owned by root (not the squatter)" \
-      [ "$(stat -c %U "/tmp/gorun-$HOST-0")" = root ]
+check "root's binary lives under root-owned directories only (not the squatter's)" \
+      path_owned_by_root "$BIN"
+
+# --- scenario 7 continued: user go env config file --------------------------------
+
+begin "17 alice with ~/.config/go/env setting GOPROXY=off [scenario 7]"
+su - alice -c "mkdir -p ~/.config/go && echo GOPROXY=off > ~/.config/go/env"
+run su - alice -c "gorun $DEPS --help"
+check "user go/env file ignored (target: GOENV=off default): compiled and ran" \
+      [ "$RC" -eq 0 ]
 
 # --- summary ---------------------------------------------------------------------
 
