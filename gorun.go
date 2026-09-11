@@ -639,6 +639,14 @@ func (s *Script) runScript() (err error) {
 		return
 	}
 
+	// the compiled binary is written to and executed from under perUserTmpDir, which has
+	// a predictable name under a possibly world-writable base - never trust a squatter's
+	// directory, whether we are about to compile or to run an existing binary
+	err = ensureOwnedDir(s.perUserTmpDir)
+	if err != nil {
+		return
+	}
+
 	if s.cleanSecs >= 0 {
 		s.clean()
 	}

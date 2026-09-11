@@ -210,14 +210,23 @@ check "explicit GOTOOLCHAIN=local fails fast with a clear version error" \
 
 # --- scenario 9: temp directory trust ---------------------------------------------
 
-begin "16 dir squatting: alice pre-creates root's gorun directory under /var/tmp [scenario 9]"
-su alice -c "mkdir -p /var/tmp/gorun-$HOST-0 && chmod 777 /var/tmp/gorun-$HOST-0"
+begin "16 dir squatting: alice pre-creates root's gorun directories [scenario 9]"
+# squat both the /var/tmp fallback location and the configured target under
+# /var/cache/gorun; the safe outcomes are a binary whose every parent is root-owned,
+# or a refusal to run
+su alice -c "mkdir -p /var/tmp/gorun-$HOST-0 /var/cache/gorun/gorun-$HOST-0 &&
+             chmod 777 /var/tmp/gorun-$HOST-0 /var/cache/gorun/gorun-$HOST-0"
 run gorun "$HELLO"
 BIN=$(find /var/tmp/gorun-* /var/cache/gorun -name '*.bin' -newer "$MARKER" 2>/dev/null | head -1)
 echo "  binary: ${BIN:-not found}"
-check "script ran" [ "$RC" -eq 0 ]
-check "root's binary lives under root-owned directories only (not the squatter's)" \
-      path_owned_by_root "$BIN"
+if [ -n "$BIN" ]; then
+    check "script ran" [ "$RC" -eq 0 ]
+    check "binary and every parent dir root-owned (squatter had no influence)" \
+          path_owned_by_root "$BIN"
+else
+    check "gorun refused the squatted directory (failed closed)" [ "$RC" -ne 0 ]
+    check "refusal names the ownership problem" out_contains "owned by uid"
+fi
 
 # --- scenario 7 continued: user go env config file --------------------------------
 

@@ -137,3 +137,32 @@ Matrix: **17 cases, 0 failed checks.** Case 16's binary now lives at
 `/var/tmp` directory irrelevant. Change 7 still to come: the perUserTmpDir ownership guard
 in `runScript()` (defence when the target base itself is squattable) and the case 16
 redesign to squat both locations and accept fail-closed refusal as the safe outcome.
+
+## Change 7 — perUserTmpDir ownership guard (2026-09-11)
+
+`runScript()` now calls `ensureOwnedDir(perUserTmpDir)` right after `initVars()` — before
+`clean()`, the concurrent-build wait, compiling, or executing a cached binary — so a
+squatter-owned directory is refused on the run path too, not only when the cache root is
+created. Matrix case 16 redesigned: alice squats *both* `/var/tmp/gorun-<host>-0` and
+`/var/cache/gorun/gorun-<host>-0`, and the checks accept either safe outcome — a binary
+whose every parent directory is root-owned, or a fail-closed refusal naming the
+ownership problem. envmatrix README finalised: "Current" column renamed "Pre-fix"
+(historical, against `e0c4727`), any FAIL is now a regression.
+
+Matrix: **17 cases, 0 failed checks** — gorun refused the squatted target directory
+("owned by uid 1001, not uid 0 - refusing to use it"), no binary written.
+
+## Result
+
+All seven changes from `go-env-review.md` implemented on `origin/master` (`e0c4727`),
+one commit each, matrix-verified at every step: 10 failed checks at baseline → 0 after
+change 7. The reported incident (root's GOPATH leaking into a less privileged user's
+build) is structurally impossible; `nobody`/homeless users get persistent caches;
+systemd/cron units work with a minimal PATH; toolchain downloads and per-user go env
+files no longer affect builds; squatted directories are refused; and with binaries and
+caches under `/var/cache/gorun`, systemd-tmpfiles ageing of `/var/tmp` no longer
+threatens them. Still open (operational, pre-rollout — see the review's "Implementation
+decisions"): audit deployed scripts' `go` directives against 1.24.2, audit for
+`go env -w` settings scripts depend on, choose a cache retention mechanism, size
+/var/cache, and deploy the tmpfiles.d rule + /etc/gorun.conf via configuration
+management.
