@@ -98,3 +98,18 @@ go 1.99.0 now fails fast with "requires go >= 1.99.0 (running go 1.24.2;
 GOTOOLCHAIN=local)" instead of attempting a toolchain download) and 17 (a user's
 `~/.config/go/env` setting GOPROXY=off no longer affects builds). Remaining: 12
 (change 5), 16 (changes 6+7).
+
+## Change 5 — goBinaryPath via go_bin, PATH, well-known fallback (2026-09-11)
+
+Moved `goBinaryPath`/`goVer`/`compiledVersion`/`installedGoVersion` into a new `gobin.go`
+as `Script` methods. Lookup order is now the configured `go_bin` (a hard error if it is
+set but missing), then the PATH, then `/usr/local/go/bin/go`; the deprecated
+`runtime.GOROOT()` lookup is gone (it was empty in `-trimpath` builds anyway, and GOROOT
+was an env-leak channel), and the `runtime` import with it — `errors` stays, as `main()`
+on this base wraps `runScript` failures with it. `goVer` now runs with `goBuildEnv()`
+instead of `os.Environ()`, so version checks and builds always agree, and parses the
+output with `strings.Fields` instead of trimming and splitting on single spaces.
+
+Matrix: **17 cases, 2 failed checks** (16×2). Newly passing: 12 (systemd/cron-style
+minimal PATH finds the toolchain via the well-known fallback). Only case 16's intentional
+fail-closed refusal remains, resolved by changes 6+7.

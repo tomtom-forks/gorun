@@ -21,7 +21,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -376,64 +375,6 @@ func runCommand(dir string, env []string, command string, args ...string) (err e
 	return
 }
 
-// goVer extracts a goversion from the output of a "go version %v" command
-func goVer(args []string, verPos int) (version string, err error) {
-	gobin, err := goBinaryPath()
-	if err != nil {
-		return
-	}
-	var stdoutBuf bytes.Buffer
-	cmd := exec.Command(gobin, args...)
-	cmd.Stdout = &stdoutBuf
-	cmd.Env = os.Environ()
-	err = cmd.Run()
-	if err == nil {
-		versionArr := strings.Split(strings.TrimSuffix(stdoutBuf.String(), "\n"), " ")
-		if len(versionArr) >= 2 {
-			version = versionArr[len(versionArr)+verPos]
-		} else {
-			err = errors.New(fmt.Sprintf("unable to find version in %+v", versionArr))
-		}
-	}
-	return
-}
-
-// compiledVersion returns the version of go used to compile a file
-func compiledVersion(filepath string) (fileVersion string, err error) {
-	// last entry is the version for a file:
-	// /tmp/gorun-myhost-0/_usr_local_bin_myFile.go/myFile.go.bin: go1.23.2
-	fileVersion, err = goVer([]string{"version", filepath}, -1)
-	return
-}
-
-// installedGoVersion returns the version of go installed on the system
-func installedGoVersion() (gobinVersion string, err error) {
-	// second last entry is the version for a file:
-	// go version go1.23.2 linux/amd64
-	gobinVersion, err = goVer([]string{"version"}, -2)
-	return
-}
-
-// goBinaryPath returns the path to the go binary
-func goBinaryPath() (gobin string, err error) {
-	// find the go binary to call via env var, std location, or the PATH
-	goRoot := runtime.GOROOT()
-	// Only use GOROOT if we have one, otherwise we end up with a relative path and os.Stat() will
-	// look in the working directory, which isn't the working dictionary later when we run the go bin.
-	if goRoot != "" {
-		gobin = filepath.Join(runtime.GOROOT(), "bin", "go")
-		if _, err := os.Stat(gobin); err == nil {
-			return gobin, nil
-		}
-	}
-
-	// Look in the PATH
-	if gobin, err = exec.LookPath("go"); err == nil {
-		return gobin, nil
-	}
-	return gobin, errors.New(fmt.Sprintf("can't find go tool in GOROOT (%s) or PATH (%s)", goRoot, os.Getenv("PATH")))
-}
-
 // compile copies the script and its dependencies to a "per run" tmp directory and compiles it there.
 // The binary is kept, but the "per run" tmp directory is removed at the end
 func (s *Script) compile() (err error) {
@@ -457,7 +398,7 @@ func (s *Script) compile() (err error) {
 
 	env := s.goBuildEnv()
 
-	gobin, err := goBinaryPath()
+	gobin, err := s.goBinaryPath()
 	if err != nil {
 		return err
 	}
@@ -675,13 +616,13 @@ func (s *Script) targetOutOfDate() (outOfDate bool, err error) {
 	// check the binary was compiled with the same version of go installed on the system.
 	// we have seen binaries filled with zeros on unclean shutdowns, this first stage should also catch that, so
 	// run it outside the s.recompileWrongGoVer check.
-	fileVersion, err := compiledVersion(s.binary)
+	fileVersion, err := s.compiledVersion(s.binary)
 	if err != nil {
 		// recompile in case it is a corrupt binary but not pollute its stdout/stderr
 		outOfDate = true
 	} else if !outOfDate && s.recompileWrongGoVer {
 		// If not, further check if the binary was compiled with the version of go installed on the system
-		gobinVersion, err := installedGoVersion()
+		gobinVersion, err := s.installedGoVersion()
 		if err != nil {
 			// we couldn't run "go version" for some reason, let's fail now
 			return true, err
