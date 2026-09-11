@@ -44,3 +44,25 @@ unknown-key config files each refused with a clear error.
 Matrix: **17 cases, 10 failed checks** — identical to baseline, as expected: the
 container installs no `/etc/gorun.conf` until change 6, and without one behaviour is
 unchanged.
+
+## Change 2 — deterministic build environment (2026-09-11)
+
+Added `buildenv.go` with `goBuildEnv()`: `os.Environ()` → config env defaults → forced
+`GOCACHE=<cacheRoot>/gocache`, `GOMODCACHE=<cacheRoot>/gomod` and the pre-existing
+`GOTMPDIR=<tmpDir>` (moved here from `compile()`, so build temporaries still land beside
+the binary for `clean()` to age) → embedded `go.env` last (last-entry-wins gives go.env >
+config > inherited). In `gorun.go`: `initVars()` resolves `cacheRoot`
+(`<cache_base>/<euid>` when configured, else `perUserTmpDir` under `/var/tmp` — decision
+3); `compile()`'s HOME/GOCACHE heuristic (including the EACCES/ENOENT trap) deleted, not
+fixed; the now-unused `getEnvVar()` removed; the `waitForActiveBuilds`/`targetOutOfDate`
+re-check that precedes the build is untouched. HOME is never modified. The review's minor
+observation (empty-string entries from splitting the `go.env` section) fixed in passing,
+using `strings.SplitSeq` (Go 1.24). `perUserTmpDir` is now named by `os.Geteuid()` like
+`cacheRoot` and the ownership checks (was `os.Getuid()`; identical in every real
+invocation, where uid == euid).
+
+Matrix: **17 cases, 4 failed checks** (12, 15, 16, 17). Newly passing: 03 (module cache
+in gorun-managed location), 04 + 05 (the reported incident: leaked GOPATH/HOME no longer
+break or redirect builds), 11 (persistent per-user cache: recompile after touch no longer
+re-downloads modules), 13 + 14 (leaked XDG_CACHE_HOME/GOCACHE ignored). Remaining fails
+belong to change 5 (12), change 4 (15, 17) and changes 3+6 (16).

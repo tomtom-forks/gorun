@@ -80,6 +80,7 @@ type Script struct {
 	binaryLastRun       string // file showing the binary was run lately (for filesystems not running atime)
 	cleanSecs           int64  // any binaries not accessed within this number of seconds get deleted (and rebuilt)
 	cleanSecsBuildDirs  int64  // any build directories for this binary older than this get deleted
+	cacheRoot           string // per-uid directory holding the persistent gocache and gomod caches
 }
 
 // realPath returns the real absolute path, resolving symlinks
@@ -193,7 +194,8 @@ func (s *Script) initVars() (err error) {
 		return
 	}
 
-	perUserTmpDir := fmt.Sprintf("gorun-%v-%v", hostname, os.Getuid())
+	// keyed by effective uid: that is the identity the ownership checks and cache dirs use
+	perUserTmpDir := fmt.Sprintf("gorun-%v-%v", hostname, os.Geteuid())
 	tmpDir := filepath.Join(perUserTmpDir,
 		strings.ReplaceAll(s.scriptPath, string(filepath.Separator), "_"))
 
@@ -213,6 +215,14 @@ func (s *Script) initVars() (err error) {
 	s.perRunTmpDir = filepath.Join(s.perRunTmpDirBase, filepath.Dir(s.scriptPath))
 	s.binary = filepath.Join(s.tmpDir, filepath.Base(s.scriptPath)+".bin")
 	s.binaryLastRun = filepath.Join(s.tmpDir, ".lastRun")
+
+	// caches are keyed by effective uid under cache_base; without a configured
+	// cache_base they live alongside this user's binaries under perUserTmpDir
+	if s.cfg.cacheBase != "" {
+		s.cacheRoot = filepath.Join(s.cfg.cacheBase, strconv.Itoa(os.Geteuid()))
+	} else {
+		s.cacheRoot = s.perUserTmpDir
+	}
 
 	// deal with a go.work file
 	gowork := getSection(s.content, GOWORK)
@@ -366,20 +376,6 @@ func runCommand(dir string, env []string, command string, args ...string) (err e
 	return
 }
 
-// getEnvVar returns the value of an environment variable from a slice of environment variables
-func getEnvVar(env []string, key string) string {
-
-	// Go through the list backwards so that we pick up the last version of any
-	// duplicate keys. This matches the behaviour of exec.Cmd.Env
-	for i := len(env) - 1; i >= 0; i-- {
-		line := env[i]
-		if strings.HasPrefix(line, key+"=") {
-			return strings.SplitAfterN(line, key+"=", 2)[1]
-		}
-	}
-	return ""
-}
-
 // goVer extracts a goversion from the output of a "go version %v" command
 func goVer(args []string, verPos int) (version string, err error) {
 	gobin, err := goBinaryPath()
@@ -455,29 +451,7 @@ func (s *Script) compile() (err error) {
 		return
 	}
 
-	// use the default environment before adding our overrides, this allows GOPRIVATE etc. to be used in the build
-	var env []string
-	section := getSection(s.content, "go.env")
-	env = os.Environ()
-	if len(section) > 0 {
-		env = append(env, strings.Split(string(section), "\n")...)
-	}
-
-	// if $HOME/.cache can't be built and $GOCACHE is not set, then use a temp home dir
-	if getEnvVar(env, "GOCACHE") == "" {
-		home := getEnvVar(env, "HOME")
-		if home == "" || home == "/" {
-			env = append(env, "HOME="+s.perRunTmpDir)
-		} else if _, err := os.Stat(filepath.Join(home, ".cache")); os.IsNotExist(err) {
-			err = os.Mkdir(filepath.Join(home, ".cache"), 0755)
-			if err != nil && !os.IsExist(err) {
-				// unable to create the .cache directory - give this process a temp home (env will likely contain HOME twice)
-				env = append(env, "HOME="+s.perRunTmpDir)
-			}
-		}
-	}
-	// custom directory for temporary files used during Go builds. Put it alongside the final binary so it can be auto-cleaned
-	env = append(env, "GOTMPDIR="+s.tmpDir)
+	env := s.goBuildEnv()
 
 	gobin, err := goBinaryPath()
 	if err != nil {
