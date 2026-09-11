@@ -113,3 +113,27 @@ output with `strings.Fields` instead of trimming and splitting on single spaces.
 Matrix: **17 cases, 2 failed checks** (16×2). Newly passing: 12 (systemd/cron-style
 minimal PATH finds the toolchain via the well-known fallback). Only case 16's intentional
 fail-closed refusal remains, resolved by changes 6+7.
+
+## Change 6 — example config: go.sh, gorun.conf, /var/cache/gorun (2026-09-11)
+
+- `example/linux/etc/profile.d/go.sh` no longer exports GOPATH (the incident's root
+  cause) and no longer sets HOME=/root; it only adds `/usr/local/go/bin`,
+  `/usr/local/gopath/bin` and (guarded) `$HOME/go/bin` to the PATH.
+- New `example/linux/etc/gorun.conf`: `go_bin=/usr/local/go/bin/go`,
+  `cache_base=/var/cache/gorun`, `target_dir_base=/var/cache/gorun` (decision 6) — the
+  latter also takes binaries out of systemd-tmpfiles' ageing of `/var/tmp`, which
+  `e0c4727`'s per-run touching works around. The tmpfiles.d line for the 1777 root-owned
+  base is documented inline; GOTOOLCHAIN/GOENV shown commented since they are built-in
+  defaults.
+- Containerfile installs the example conf (chmod 644 — the repo copy is group-writable
+  and would be refused) and creates `/var/cache/gorun` mode 1777; `reset()` in the matrix
+  recreates that base per case, as tmpfiles.d would at boot.
+- Main README: default location and toolchain-location bullets updated, the nobody/HOME
+  gotcha rewritten (caches are persistent, HOME never modified), new "Site configuration
+  (/etc/gorun.conf)" section; envmatrix README note about installing the conf resolved.
+
+Matrix: **17 cases, 0 failed checks.** Case 16's binary now lives at
+`/var/cache/gorun/gorun-<host>-0/...` — every path component root-owned, the squatted
+`/var/tmp` directory irrelevant. Change 7 still to come: the perUserTmpDir ownership guard
+in `runScript()` (defence when the target base itself is squattable) and the case 16
+redesign to squat both locations and accept fail-closed refusal as the safe outcome.

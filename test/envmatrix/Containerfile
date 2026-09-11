@@ -29,9 +29,12 @@ ENV PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sb
 COPY go.mod go.sum *.go /src/
 RUN cd /src && go build -trimpath -o /usr/local/bin/gorun .
 
-# The example environment config under review, and the shared GOPATH it refers to
+# The example environment config under review, and the shared GOPATH it refers to.
+# gorun.conf must be root-owned and not group/world writable; the cache base is
+# root-owned mode 1777 (sticky), as the tmpfiles.d example in gorun.conf creates it.
 COPY example/linux/etc/profile.d/go.sh /etc/profile.d/go.sh
-RUN mkdir -p /usr/local/gopath
+COPY example/linux/etc/gorun.conf /etc/gorun.conf
+RUN chmod 644 /etc/gorun.conf && mkdir -p /usr/local/gopath && mkdir -m 1777 /var/cache/gorun
 
 # Test users:
 #   alice  - normal user with a home directory

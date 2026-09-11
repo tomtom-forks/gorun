@@ -29,6 +29,7 @@ reset() {
     rm -rf /var/tmp/gorun-* /root/.cache /root/go /var/cache/gorun \
            /home/alice/.cache /home/alice/.config /home/alice/go /home/ghost
     rm -rf /usr/local/gopath && mkdir /usr/local/gopath  # root-owned, as installed
+    mkdir -m 1777 /var/cache/gorun                       # as tmpfiles.d would create it
     touch "$MARKER"
     sleep 1  # keep new mtimes strictly after the marker
 }

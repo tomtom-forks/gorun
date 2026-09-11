@@ -60,9 +60,10 @@ directories gained files (and their owner), and `CHECK` lines asserting the
 
 **CHECK FAILs against the current gorun are expected** — 10 at the time of
 writing, per the table above. A gorun implementing the `/etc/gorun.conf` design
-should reach 0. Once an example `/etc/gorun.conf` exists under `example/linux/etc/`,
-add it to the Containerfile so the matrix exercises the configured path as well
-as the built-in defaults.
+should reach 0. The Containerfile installs the example `/etc/gorun.conf` from
+`example/linux/etc/`, so the matrix exercises the configured paths
+(`/var/cache/gorun`); the config-refusal and no-config code paths are covered
+by gorun's own hard-error checks and the built-in fallbacks.
 
 ## Notes
 
