@@ -130,7 +130,10 @@ There are multiple ways of making the "script" executable. The simplest is to ad
 top of the file
 
 It is convenient to not have to have a shebang at the top of the file (it doesn't compile!). If running on Linux,
-binfmt_misc can be used to instruct the kernel how to deal with executable programs - see [gorun-register.sh](./example/linux/usr/local/bin/gorun-register.sh)
+binfmt_misc can be used to instruct the kernel how to deal with executable programs - install
+[gorun.conf](./example/linux/etc/binfmt.d/gorun.conf) as /etc/binfmt.d/gorun.conf and run
+```systemctl restart systemd-binfmt``` (systemd's built-in systemd-binfmt.service applies /etc/binfmt.d/
+at boot, so the registrations survive reboots).
 This allows the file to just be a standard go file (no shebang) or to have a special first line comment.
 
 The first line comment of "///bin/env gorun" is useful where the script file name cannot end in ".go", e.g.
