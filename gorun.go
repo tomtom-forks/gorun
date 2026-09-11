@@ -43,6 +43,8 @@ func Usage() {
 	fmt.Fprintf(flag.CommandLine.Output(), `%s: Compile and run a go "script" in a single command.
 
 Options can be provided via GORUN_ARGS environment variable, or on the command line.
+Site configuration is read from /etc/gorun.conf when present; GORUN_ARGS is then ignored,
+command-line flags still apply.
 If there exists a directory of the same base name as the .go file, plus a trailing '_', that
 too will be copied and included in the build of the go program.
 
@@ -59,6 +61,7 @@ const (
 )
 
 type Script struct {
+	cfg                 *Config  // site configuration from /etc/gorun.conf (never nil)
 	debug               bool     // more output, don't delete temporary files (GORUN_ARGS=-debug if running script)
 	recompileWrongGoVer bool     // recompile the binary if the go version doesn't match the installed version
 	noRun               bool     // recompile of the binary if required, but don't run. Handy for testing before deployment
@@ -92,24 +95,40 @@ func realPath(sourceFile string) (realPath string, err error) {
 func main() {
 	flag.Usage = Usage
 
-	// gather all args, command line and GORUN_ARGS in to one array
+	cfg, err := loadConfig(configPath)
+	// if the config file exists but is insecurely owned or permissioned, or unparseable, we refuse to run
+	// missing config file is not an error, we just use the built-in defaults
+	if err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		os.Exit(1)
+	}
+
+	// gather all args, command line and GORUN_ARGS in to one array. GORUN_ARGS arrives via
+	// the environment, so once a site config exists it is ignored: only real command-line
+	// flags may override site policy.
 	gorunArgsEnv, _ := os.LookupEnv("GORUN_ARGS")
+	if cfg.exists && gorunArgsEnv != "" {
+		_, _ = fmt.Fprintf(os.Stderr, "warning: GORUN_ARGS ignored because %v exists\n", configPath)
+		gorunArgsEnv = ""
+	}
 	gorunArgs := strings.Fields(gorunArgsEnv)
 	args := append(gorunArgs, os.Args[1:]...)
 
 	var diff, embed, extract, extractIfMissing, version bool
 	var cleanDays int64
 
-	s := Script{}
+	s := Script{cfg: cfg}
 
-	flag.Int64Var(&cleanDays, "cleanDays", 14, "clean all binaries from this user older than N days. Set to -1 to disable cleaning")
+	// flag defaults come from the config (built-in defaults overlaid by the file), so
+	// parsing the command line last completes the precedence chain
+	flag.Int64Var(&cleanDays, "cleanDays", cfg.cleanDays, "clean all binaries from this user older than N days. Set to -1 to disable cleaning")
 	flag.BoolVar(&diff, "diff", false, "show diff between embedded comments and filesystem go.mod/go.sum/go.work/go.work.sum")
 	flag.BoolVar(&embed, "embed", false, "embed filesystem go.mod/go.sum/go.work/go.work.sum as comments in source file")
 	flag.BoolVar(&extract, "extract", false, "extract the comments to filesystem go.mod/go.sum/go.work/go.work.sum")
 	flag.BoolVar(&extractIfMissing, "extractIfMissing", false, "extract the comments to filesystem go.mod/go.sum/go.work/go.work.sum only if BOTH files do not exist on disc")
 	flag.BoolVar(&s.debug, "debug", false, "provide more debug, don't delete temporary files under /tmp")
 	flag.BoolVar(&s.recompileWrongGoVer, "recompileWrongGoVer", false, "recompile the script if the compiled target wasn't compiled with the currently installed go version")
-	flag.StringVar(&s.tmpDirBase, "targetDirBase", "/var/tmp", "directory to copy script and extract go.mod etc. to before building")
+	flag.StringVar(&s.tmpDirBase, "targetDirBase", cfg.targetDirBase, "directory to copy script and extract go.mod etc. to before building")
 	flag.BoolVar(&version, "version", false, "Print version info and exit")
 	flag.BoolVar(&s.noRun, "noRun", false, "recompile of the binary if required, but don't run. Handy for testing before deployment")
 	flag.CommandLine.Parse(args)
