@@ -66,3 +66,22 @@ in gorun-managed location), 04 + 05 (the reported incident: leaked GOPATH/HOME n
 break or redirect builds), 11 (persistent per-user cache: recompile after touch no longer
 re-downloads modules), 13 + 14 (leaked XDG_CACHE_HOME/GOCACHE ignored). Remaining fails
 belong to change 5 (12), change 4 (15, 17) and changes 3+6 (16).
+
+## Change 3 — create and guard the per-uid cache dirs (2026-09-11)
+
+Added `safedir.go` with `ensureOwnedDir()`: MkdirAll 0700, then refuse unless the
+directory is owned by the effective uid with no group/other access (decision 4: fail
+closed, the condition is root-fixable). `compile()` guards `cacheRoot` before doing
+anything. `clean()` skips the `gocache`/`gomod` dirs *before both of its passes* — on this
+base that matters: the stale-build-dir sweep added in `a49b610` deletes numeric-named
+subdirectories older than an hour as abandoned PID dirs, and the Go build cache's shard
+directories (`00`..`ff`) are numeric, so in the no-config fallback layout they would have
+been pruned. The post-build chmod walk is removed — the read-only module cache no longer
+lives under the deleted per-run directory.
+
+Matrix: **17 cases, 5 failed checks** (12, 15, 16×2, 17) — the expected interim
+regression: case 16's squatted `/var/tmp/gorun-<host>-0` is now *refused* instead of
+silently used, so its "script ran" check fails alongside the ownership check.
+Fail-closed is the decided behaviour; the case passes once change 6 moves binaries under
+`/var/cache/gorun`, and change 7 redesigns its checks to accept refusal as the safe
+outcome. All other results unchanged from change 2.

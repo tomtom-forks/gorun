@@ -437,6 +437,10 @@ func goBinaryPath() (gobin string, err error) {
 // compile copies the script and its dependencies to a "per run" tmp directory and compiles it there.
 // The binary is kept, but the "per run" tmp directory is removed at the end
 func (s *Script) compile() (err error) {
+	err = ensureOwnedDir(s.cacheRoot)
+	if err != nil {
+		return
+	}
 	if !s.debug {
 		defer os.RemoveAll(s.perRunTmpDirBase)
 	}
@@ -466,14 +470,8 @@ func (s *Script) compile() (err error) {
 		return err
 	}
 	err = os.Rename(out, s.binary)
-	// os.RemoveAll mode 444 files (from go build cache being here when no HOME dir set) on Unix don't allow unlink
-	// so let's chmod all files/dirs to allow the deferred RemoveAll to work
-	_ = filepath.Walk(s.perRunTmpDirBase, func(name string, info os.FileInfo, err error) error {
-		if err == nil {
-			err = os.Chmod(name, 0755)
-		}
-		return err
-	})
+	// the read-only module cache no longer lives under the per-run dir (it is in
+	// cacheRoot), so the deferred RemoveAll needs no chmod walk any more
 	return
 }
 
@@ -596,6 +594,13 @@ func (s *Script) clean() (err error) {
 
 	for _, info := range infos {
 		if info.IsDir() {
+			// without a configured cache_base the persistent per-uid caches live alongside
+			// the per-script dirs. They are not stale scripts, and the build cache's shard
+			// dirs (00..ff) are numeric - the PID-dir sweep below would prune them - so
+			// skip them before either pass
+			if info.Name() == "gocache" || info.Name() == "gomod" {
+				continue
+			}
 			scriptDir := filepath.Join(s.perUserTmpDir, info.Name())
 
 			// Check and clean the binary if it hasn't been accessed recently
