@@ -15,6 +15,11 @@ import (
 // ~/.netrc and git credentials keep working for private module fetches.
 func (s *Script) goBuildEnv() (env []string) {
 	env = os.Environ()
+	// built-in defaults: build with exactly the installed toolchain rather than
+	// auto-downloading one, and ignore any per-user go env config file so the embedded
+	// go.env section stays the per-script authority. The config file (next) and the
+	// embedded go.env (last) can both override these.
+	env = append(env, "GOTOOLCHAIN=local", "GOENV=off")
 	env = append(env, s.cfg.env...)
 	// forced gorun-managed locations. GOTMPDIR sits alongside the binary so build
 	// temporaries are auto-cleaned with it.

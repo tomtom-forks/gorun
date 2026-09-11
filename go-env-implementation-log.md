@@ -85,3 +85,16 @@ silently used, so its "script ran" check fails alongside the ownership check.
 Fail-closed is the decided behaviour; the case passes once change 6 moves binaries under
 `/var/cache/gorun`, and change 7 redesigns its checks to accept refusal as the safe
 outcome. All other results unchanged from change 2.
+
+## Change 4 — GOTOOLCHAIN=local and GOENV=off built-in defaults (2026-09-11)
+
+`goBuildEnv()` now appends `GOTOOLCHAIN=local` and `GOENV=off` immediately after
+`os.Environ()`, so they override inherited values but are themselves overridable by the
+config file's env keys and by the embedded `go.env` section (decision 2's forced set is
+now complete: GOCACHE, GOMODCACHE, GOTOOLCHAIN, GOENV, with GOTMPDIR alongside).
+
+Matrix: **17 cases, 3 failed checks** (12, 16×2). Newly passing: 15 (a go.mod requiring
+go 1.99.0 now fails fast with "requires go >= 1.99.0 (running go 1.24.2;
+GOTOOLCHAIN=local)" instead of attempting a toolchain download) and 17 (a user's
+`~/.config/go/env` setting GOPROXY=off no longer affects builds). Remaining: 12
+(change 5), 16 (changes 6+7).
