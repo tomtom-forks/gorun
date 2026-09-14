@@ -18,10 +18,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -43,6 +43,8 @@ func Usage() {
 	fmt.Fprintf(flag.CommandLine.Output(), `%s: Compile and run a go "script" in a single command.
 
 Options can be provided via GORUN_ARGS environment variable, or on the command line.
+Site configuration is read from /etc/gorun.conf when present; GORUN_ARGS is then ignored,
+command-line flags still apply.
 If there exists a directory of the same base name as the .go file, plus a trailing '_', that
 too will be copied and included in the build of the go program.
 
@@ -59,6 +61,7 @@ const (
 )
 
 type Script struct {
+	cfg                 *Config  // site configuration from /etc/gorun.conf (never nil)
 	debug               bool     // more output, don't delete temporary files (GORUN_ARGS=-debug if running script)
 	recompileWrongGoVer bool     // recompile the binary if the go version doesn't match the installed version
 	noRun               bool     // recompile of the binary if required, but don't run. Handy for testing before deployment
@@ -77,6 +80,7 @@ type Script struct {
 	binaryLastRun       string // file showing the binary was run lately (for filesystems not running atime)
 	cleanSecs           int64  // any binaries not accessed within this number of seconds get deleted (and rebuilt)
 	cleanSecsBuildDirs  int64  // any build directories for this binary older than this get deleted
+	cacheRoot           string // per-uid directory holding the persistent gocache and gomod caches
 }
 
 // realPath returns the real absolute path, resolving symlinks
@@ -92,24 +96,40 @@ func realPath(sourceFile string) (realPath string, err error) {
 func main() {
 	flag.Usage = Usage
 
-	// gather all args, command line and GORUN_ARGS in to one array
+	cfg, err := loadConfig(configPath)
+	// if the config file exists but is insecurely owned or permissioned, or unparseable, we refuse to run
+	// missing config file is not an error, we just use the built-in defaults
+	if err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, "error: "+err.Error())
+		os.Exit(1)
+	}
+
+	// gather all args, command line and GORUN_ARGS in to one array. GORUN_ARGS arrives via
+	// the environment, so once a site config exists it is ignored: only real command-line
+	// flags may override site policy.
 	gorunArgsEnv, _ := os.LookupEnv("GORUN_ARGS")
+	if cfg.exists && gorunArgsEnv != "" {
+		_, _ = fmt.Fprintf(os.Stderr, "warning: GORUN_ARGS ignored because %v exists\n", configPath)
+		gorunArgsEnv = ""
+	}
 	gorunArgs := strings.Fields(gorunArgsEnv)
 	args := append(gorunArgs, os.Args[1:]...)
 
 	var diff, embed, extract, extractIfMissing, version bool
 	var cleanDays int64
 
-	s := Script{}
+	s := Script{cfg: cfg}
 
-	flag.Int64Var(&cleanDays, "cleanDays", 14, "clean all binaries from this user older than N days. Set to -1 to disable cleaning")
+	// flag defaults come from the config (built-in defaults overlaid by the file), so
+	// parsing the command line last completes the precedence chain
+	flag.Int64Var(&cleanDays, "cleanDays", cfg.cleanDays, "clean all binaries from this user older than N days. Set to -1 to disable cleaning")
 	flag.BoolVar(&diff, "diff", false, "show diff between embedded comments and filesystem go.mod/go.sum/go.work/go.work.sum")
 	flag.BoolVar(&embed, "embed", false, "embed filesystem go.mod/go.sum/go.work/go.work.sum as comments in source file")
 	flag.BoolVar(&extract, "extract", false, "extract the comments to filesystem go.mod/go.sum/go.work/go.work.sum")
 	flag.BoolVar(&extractIfMissing, "extractIfMissing", false, "extract the comments to filesystem go.mod/go.sum/go.work/go.work.sum only if BOTH files do not exist on disc")
 	flag.BoolVar(&s.debug, "debug", false, "provide more debug, don't delete temporary files under /tmp")
 	flag.BoolVar(&s.recompileWrongGoVer, "recompileWrongGoVer", false, "recompile the script if the compiled target wasn't compiled with the currently installed go version")
-	flag.StringVar(&s.tmpDirBase, "targetDirBase", "/var/tmp", "directory to copy script and extract go.mod etc. to before building")
+	flag.StringVar(&s.tmpDirBase, "targetDirBase", cfg.targetDirBase, "directory to copy script and extract go.mod etc. to before building")
 	flag.BoolVar(&version, "version", false, "Print version info and exit")
 	flag.BoolVar(&s.noRun, "noRun", false, "recompile of the binary if required, but don't run. Handy for testing before deployment")
 	flag.CommandLine.Parse(args)
@@ -125,8 +145,17 @@ func main() {
 		os.Exit(0)
 	}
 
-	if len(args) == flag.NFlag() {
+	// no positional argument left after the flags means no script file was given
+	if flag.NArg() == 0 {
 		Usage()
+		os.Exit(1)
+	}
+	// when running, extra arguments belong to the script; the embed/extract/diff modes
+	// act on exactly one script file, so extra arguments there are almost certainly a
+	// shell glob that matched more than intended (e.g. dir/*.go picking up _test.go files)
+	if (diff || embed || extract || extractIfMissing) && flag.NArg() > 1 {
+		_, _ = fmt.Fprintf(os.Stderr, "error: -diff/-embed/-extract/-extractIfMissing take a single script file, got %v: %v\n",
+			flag.NArg(), strings.Join(flag.Args(), " "))
 		os.Exit(1)
 	}
 
@@ -136,8 +165,8 @@ func main() {
 
 	sourceFile, err := realPath(flag.Arg(0))
 	if err != nil {
-		fmt.Printf("Failed to find source file %v\n", err.Error())
-		return
+		_, _ = fmt.Fprintf(os.Stderr, "error: failed to find source file: %v\n", err)
+		os.Exit(1)
 	}
 	s.scriptPath = sourceFile
 
@@ -151,8 +180,10 @@ func main() {
 		err = s.embedEmbedded()
 	} else {
 		err = s.runScript()
-		if err != nil {
-			err = errors.New("running script failed to find compiled binary: " + err.Error())
+		if errors.Is(err, fs.ErrNotExist) {
+			// runScript retries when the binary vanishes underneath it; only this case
+			// is about the binary - other errors already say what went wrong
+			err = fmt.Errorf("running script failed to find compiled binary: %w", err)
 		}
 	}
 	if err != nil {
@@ -174,7 +205,8 @@ func (s *Script) initVars() (err error) {
 		return
 	}
 
-	perUserTmpDir := fmt.Sprintf("gorun-%v-%v", hostname, os.Getuid())
+	// keyed by effective uid: that is the identity the ownership checks and cache dirs use
+	perUserTmpDir := fmt.Sprintf("gorun-%v-%v", hostname, os.Geteuid())
 	tmpDir := filepath.Join(perUserTmpDir,
 		strings.ReplaceAll(s.scriptPath, string(filepath.Separator), "_"))
 
@@ -195,6 +227,14 @@ func (s *Script) initVars() (err error) {
 	s.binary = filepath.Join(s.tmpDir, filepath.Base(s.scriptPath)+".bin")
 	s.binaryLastRun = filepath.Join(s.tmpDir, ".lastRun")
 
+	// caches are keyed by effective uid under cache_base; without a configured
+	// cache_base they live alongside this user's binaries under perUserTmpDir
+	if s.cfg.cacheBase != "" {
+		s.cacheRoot = filepath.Join(s.cfg.cacheBase, strconv.Itoa(os.Geteuid()))
+	} else {
+		s.cacheRoot = s.perUserTmpDir
+	}
+
 	// deal with a go.work file
 	gowork := getSection(s.content, GOWORK)
 
@@ -213,38 +253,36 @@ func (s *Script) initVars() (err error) {
 	return
 }
 
-// simplistic copy files from one directory to another, deleting files that no longer exist
-// given /tmp/path/<goscript>_ directory as dstDir and /path/<goscript>_ directory as srcDir
+// copyDir copies the regular files and directories under srcDir to dstDir (it does not
+// remove anything already in dstDir), e.g. /path/<goscript>_ to /var/tmp/.../<goscript>_
 func copyDir(dstDir string, srcDir string) (err error) {
-	err = filepath.Walk(srcDir, func(srcPath string, f os.FileInfo, err error) error {
+	return filepath.WalkDir(srcDir, func(srcPath string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		relPath, err := filepath.Rel(srcDir, srcPath)
-		switch f.Mode() & os.ModeType {
-		case 0: // Regular file
+		if err != nil {
+			return err
+		}
+		dstPath := filepath.Join(dstDir, relPath)
+		switch d.Type() {
+		case 0: // Regular file - the os errors already name the operation and path
 			content, err := os.ReadFile(srcPath)
 			if err != nil {
-				fmt.Fprintln(os.Stderr, "Failed to read (while copying) "+relPath+" to "+dstDir)
 				return err
 			}
-			err = os.WriteFile(filepath.Join(dstDir, relPath), content, 0600)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "Failed to write (while copying) "+relPath+" to "+dstDir)
+			if err = os.WriteFile(dstPath, content, 0600); err != nil {
 				return err
 			}
 		case os.ModeDir:
-			os.Mkdir(filepath.Join(dstDir, relPath), 0700)
-			return nil
+			if err = os.Mkdir(dstPath, 0700); err != nil && !errors.Is(err, fs.ErrExist) {
+				return err
+			}
 		default:
-			return fmt.Errorf("We only handle regular files, not %s", relPath)
+			return fmt.Errorf("only regular files can be copied, not %v", relPath)
 		}
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-	return
 }
 
 // writeFileFromCommentsOrDir uses either the parsed commented section or the file on disc and copies it to the target dir
@@ -255,7 +293,12 @@ func (s *Script) writeFileFromCommentsOrDir(content []byte, sectionName string) 
 		return
 	}
 	if !written {
-		_ = copyDir(filepath.Join(s.perRunTmpDir, sectionName), filepath.Join(filepath.Dir(s.scriptPath), sectionName))
+		// no embedded section: use the file beside the script if there is one. These files
+		// are optional, so a missing one is not an error - anything else is
+		err = copyDir(filepath.Join(s.perRunTmpDir, sectionName), filepath.Join(filepath.Dir(s.scriptPath), sectionName))
+		if errors.Is(err, fs.ErrNotExist) {
+			err = nil
+		}
 	}
 	return
 }
@@ -265,11 +308,10 @@ func (s *Script) updateTarget() (err error) {
 	os.RemoveAll(s.perRunTmpDirBase) // just in case it still exists
 	err = os.MkdirAll(s.perRunTmpDirBase, 0700)
 	if err != nil {
-		fmt.Printf("Failed to mkdirAll for %v. %v\n", s.perRunTmpDirBase, err.Error())
-		return
+		return fmt.Errorf("creating build dir: %w", err)
 	}
 
-	checkDirs := []string{}
+	var checkDirs []string
 	if s.scriptExtraDir != "" {
 		checkDirs = append(checkDirs, s.scriptExtraDir)
 	}
@@ -279,13 +321,11 @@ func (s *Script) updateTarget() (err error) {
 		dest := filepath.Join(s.perRunTmpDirBase, dir)
 		err = os.MkdirAll(dest, 0700)
 		if err != nil {
-			fmt.Printf("Failed to mkdirAll on %v. %v\n", dest, err.Error())
-			return
+			return fmt.Errorf("creating build dir: %w", err)
 		}
 
 		err = copyDir(dest, src)
 		if err != nil {
-			fmt.Printf("Failed to copyDir %v\n", err.Error())
 			return
 		}
 	}
@@ -302,8 +342,7 @@ func (s *Script) updateTarget() (err error) {
 	}
 	err = os.MkdirAll(filepath.Dir(dstScriptPath), 0700)
 	if err != nil {
-		fmt.Printf("Failed to mkdirAll for %v. %v\n", filepath.Dir(dstScriptPath), err.Error())
-		return
+		return fmt.Errorf("creating build dir: %w", err)
 	}
 	err = os.WriteFile(dstScriptPath, s.content, 0600)
 	if err != nil {
@@ -342,86 +381,18 @@ func runCommand(dir string, env []string, command string, args ...string) (err e
 	cmd.Env = env
 	err = cmd.Run()
 	if err != nil {
-		fmt.Printf("Run command %v %v failed with %s\n", command, args, err)
+		return fmt.Errorf("%v %v: %w", command, strings.Join(args, " "), err)
 	}
 	return
-}
-
-// getEnvVar returns the value of an environment variable from a slice of environment variables
-func getEnvVar(env []string, key string) string {
-
-	// Go through the list backwards so that we pick up the last version of any
-	// duplicate keys. This matches the behaviour of exec.Cmd.Env
-	for i := len(env) - 1; i >= 0; i-- {
-		line := env[i]
-		if strings.HasPrefix(line, key+"=") {
-			return strings.SplitAfterN(line, key+"=", 2)[1]
-		}
-	}
-	return ""
-}
-
-// goVer extracts a goversion from the output of a "go version %v" command
-func goVer(args []string, verPos int) (version string, err error) {
-	gobin, err := goBinaryPath()
-	if err != nil {
-		return
-	}
-	var stdoutBuf bytes.Buffer
-	cmd := exec.Command(gobin, args...)
-	cmd.Stdout = &stdoutBuf
-	cmd.Env = os.Environ()
-	err = cmd.Run()
-	if err == nil {
-		versionArr := strings.Split(strings.TrimSuffix(stdoutBuf.String(), "\n"), " ")
-		if len(versionArr) >= 2 {
-			version = versionArr[len(versionArr)+verPos]
-		} else {
-			err = errors.New(fmt.Sprintf("unable to find version in %+v", versionArr))
-		}
-	}
-	return
-}
-
-// compiledVersion returns the version of go used to compile a file
-func compiledVersion(filepath string) (fileVersion string, err error) {
-	// last entry is the version for a file:
-	// /tmp/gorun-myhost-0/_usr_local_bin_myFile.go/myFile.go.bin: go1.23.2
-	fileVersion, err = goVer([]string{"version", filepath}, -1)
-	return
-}
-
-// installedGoVersion returns the version of go installed on the system
-func installedGoVersion() (gobinVersion string, err error) {
-	// second last entry is the version for a file:
-	// go version go1.23.2 linux/amd64
-	gobinVersion, err = goVer([]string{"version"}, -2)
-	return
-}
-
-// goBinaryPath returns the path to the go binary
-func goBinaryPath() (gobin string, err error) {
-	// find the go binary to call via env var, std location, or the PATH
-	goRoot := runtime.GOROOT()
-	// Only use GOROOT if we have one, otherwise we end up with a relative path and os.Stat() will
-	// look in the working directory, which isn't the working dictionary later when we run the go bin.
-	if goRoot != "" {
-		gobin = filepath.Join(runtime.GOROOT(), "bin", "go")
-		if _, err := os.Stat(gobin); err == nil {
-			return gobin, nil
-		}
-	}
-
-	// Look in the PATH
-	if gobin, err = exec.LookPath("go"); err == nil {
-		return gobin, nil
-	}
-	return gobin, errors.New(fmt.Sprintf("can't find go tool in GOROOT (%s) or PATH (%s)", goRoot, os.Getenv("PATH")))
 }
 
 // compile copies the script and its dependencies to a "per run" tmp directory and compiles it there.
 // The binary is kept, but the "per run" tmp directory is removed at the end
 func (s *Script) compile() (err error) {
+	err = ensureOwnedDir(s.cacheRoot)
+	if err != nil {
+		return
+	}
 	if !s.debug {
 		defer os.RemoveAll(s.perRunTmpDirBase)
 	}
@@ -436,31 +407,9 @@ func (s *Script) compile() (err error) {
 		return
 	}
 
-	// use the default environment before adding our overrides, this allows GOPRIVATE etc. to be used in the build
-	var env []string
-	section := getSection(s.content, "go.env")
-	env = os.Environ()
-	if len(section) > 0 {
-		env = append(env, strings.Split(string(section), "\n")...)
-	}
+	env := s.goBuildEnv()
 
-	// if $HOME/.cache can't be built and $GOCACHE is not set, then use a temp home dir
-	if getEnvVar(env, "GOCACHE") == "" {
-		home := getEnvVar(env, "HOME")
-		if home == "" || home == "/" {
-			env = append(env, "HOME="+s.perRunTmpDir)
-		} else if _, err := os.Stat(filepath.Join(home, ".cache")); os.IsNotExist(err) {
-			err = os.Mkdir(filepath.Join(home, ".cache"), 0755)
-			if err != nil && !os.IsExist(err) {
-				// unable to create the .cache directory - give this process a temp home (env will likely contain HOME twice)
-				env = append(env, "HOME="+s.perRunTmpDir)
-			}
-		}
-	}
-	// custom directory for temporary files used during Go builds. Put it alongside the final binary so it can be auto-cleaned
-	env = append(env, "GOTMPDIR="+s.tmpDir)
-
-	gobin, err := goBinaryPath()
+	gobin, err := s.goBinaryPath()
 	if err != nil {
 		return err
 	}
@@ -473,14 +422,8 @@ func (s *Script) compile() (err error) {
 		return err
 	}
 	err = os.Rename(out, s.binary)
-	// os.RemoveAll mode 444 files (from go build cache being here when no HOME dir set) on Unix don't allow unlink
-	// so let's chmod all files/dirs to allow the deferred RemoveAll to work
-	_ = filepath.Walk(s.perRunTmpDirBase, func(name string, info os.FileInfo, err error) error {
-		if err == nil {
-			err = os.Chmod(name, 0755)
-		}
-		return err
-	})
+	// the read-only module cache no longer lives under the per-run dir (it is in
+	// cacheRoot), so the deferred RemoveAll needs no chmod walk any more
 	return
 }
 
@@ -513,7 +456,7 @@ func (s *Script) hasActiveBuild() bool {
 				if pid != currentPID && isProcessRunning(pid) {
 					if pid < currentPID {
 						if s.debug {
-							_, _ = fmt.Fprintf(os.Stdout, "[%v] Detected lower active build process with PID %d\n", currentPID, pid)
+							_, _ = fmt.Fprintf(os.Stderr, "[%v] Detected lower active build process with PID %d\n", currentPID, pid)
 						}
 						return true
 					}
@@ -531,7 +474,7 @@ func (s *Script) waitForActiveBuilds() bool {
 	waitTime := 100 * time.Millisecond
 	maxWaitTime := 2 * time.Second
 
-	for i := 0; i < maxRetries; i++ {
+	for i := range maxRetries {
 		if !s.hasActiveBuild() {
 			return true
 		}
@@ -548,10 +491,7 @@ func (s *Script) waitForActiveBuilds() bool {
 		}
 
 		// Exponential backoff, but cap at maxWaitTime
-		waitTime *= 2
-		if waitTime > maxWaitTime {
-			waitTime = maxWaitTime
-		}
+		waitTime = min(waitTime*2, maxWaitTime)
 	}
 
 	// Timeout occurred, but we'll proceed anyway
@@ -563,14 +503,14 @@ func (s *Script) waitForActiveBuilds() bool {
 
 func touchFile(file string, onlyIfExists bool) (err error) {
 	_, err = os.Stat(file)
-	if os.IsNotExist(err) {
+	if errors.Is(err, fs.ErrNotExist) {
 		if !onlyIfExists {
 			var f *os.File
 			f, err = os.Create(file)
 			defer f.Close()
 		}
 	} else {
-		currentTime := time.Now().Local()
+		currentTime := time.Now()
 		err = os.Chtimes(file, currentTime, currentTime)
 	}
 	return
@@ -590,24 +530,27 @@ func (s *Script) run() (err error) {
 // Check a file in each directory to see when it was last touched (last run)
 // Also remove any per-process build and cache directories that are older than cleanSecsBuildDirs
 func (s *Script) clean() (err error) {
-	perUserDir, err := os.Open(s.perUserTmpDir)
-	if err != nil {
-		return
-	}
-	infos, err := perUserDir.Readdir(-1)
+	entries, err := os.ReadDir(s.perUserTmpDir)
 	if err != nil {
 		return
 	}
 	cutoffTime := time.Now().Add(time.Duration(-s.cleanSecs) * time.Second)
 	buildDirCutoffTime := time.Now().Add(time.Duration(-s.cleanSecsBuildDirs) * time.Second)
 
-	for _, info := range infos {
-		if info.IsDir() {
-			scriptDir := filepath.Join(s.perUserTmpDir, info.Name())
+	for _, entry := range entries {
+		if entry.IsDir() {
+			// without a configured cache_base the persistent per-uid caches live alongside
+			// the per-script dirs. They are not stale scripts, and the build cache's shard
+			// dirs (00..ff) are numeric - the PID-dir sweep below would prune them - so
+			// skip them before either pass
+			if entry.Name() == "gocache" || entry.Name() == "gomod" {
+				continue
+			}
+			scriptDir := filepath.Join(s.perUserTmpDir, entry.Name())
 
 			// Check and clean the binary if it hasn't been accessed recently
 			st, err := os.Stat(filepath.Join(scriptDir, ".lastRun"))
-			if !os.IsNotExist(err) && st.ModTime().Before(cutoffTime) {
+			if err == nil && st.ModTime().Before(cutoffTime) {
 				os.RemoveAll(scriptDir)
 				continue // Directory removed, skip build dir cleanup
 			}
@@ -651,15 +594,19 @@ func (s *Script) targetOutOfDate() (outOfDate bool, err error) {
 		return
 	}
 	// if we have any extra source directories, check whether any are newer than the binary.
-	checkDirs := []string{}
+	var checkDirs []string
 	if s.scriptExtraDir != "" {
 		checkDirs = append(checkDirs, s.scriptExtraDir)
 	}
 	checkDirs = append(checkDirs, s.scriptWorkDirs...)
 	for _, checkDir := range checkDirs {
-		err = filepath.Walk(checkDir, func(path string, info os.FileInfo, err error) error {
+		err = filepath.WalkDir(checkDir, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				_, _ = fmt.Fprintf(os.Stderr, "FATAL: Unable to find dependency: %v\n", path)
+				return err
+			}
+			info, err := d.Info()
+			if err != nil {
 				return err
 			}
 			if info.ModTime().After(oldestSrcInfo.ModTime()) {
@@ -677,13 +624,13 @@ func (s *Script) targetOutOfDate() (outOfDate bool, err error) {
 	// check the binary was compiled with the same version of go installed on the system.
 	// we have seen binaries filled with zeros on unclean shutdowns, this first stage should also catch that, so
 	// run it outside the s.recompileWrongGoVer check.
-	fileVersion, err := compiledVersion(s.binary)
+	fileVersion, err := s.compiledVersion(s.binary)
 	if err != nil {
 		// recompile in case it is a corrupt binary but not pollute its stdout/stderr
 		outOfDate = true
 	} else if !outOfDate && s.recompileWrongGoVer {
 		// If not, further check if the binary was compiled with the version of go installed on the system
-		gobinVersion, err := installedGoVersion()
+		gobinVersion, err := s.installedGoVersion()
 		if err != nil {
 			// we couldn't run "go version" for some reason, let's fail now
 			return true, err
@@ -700,6 +647,14 @@ func (s *Script) runScript() (err error) {
 		return
 	}
 
+	// the compiled binary is written to and executed from under perUserTmpDir, which has
+	// a predictable name under a possibly world-writable base - never trust a squatter's
+	// directory, whether we are about to compile or to run an existing binary
+	err = ensureOwnedDir(s.perUserTmpDir)
+	if err != nil {
+		return
+	}
+
 	if s.cleanSecs >= 0 {
 		s.clean()
 	}
@@ -707,7 +662,7 @@ func (s *Script) runScript() (err error) {
 	// our feet too. We could also get our directory deleted entirely from under us as part of
 	// a clean up, so let's try multiple times
 	var outOfDate bool
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		outOfDate, err = s.targetOutOfDate()
 		if err != nil {
 			return // can't find the source file - let's bail
@@ -731,7 +686,7 @@ func (s *Script) runScript() (err error) {
 		if !s.noRun {
 			err = s.run()
 		}
-		if !os.IsNotExist(err) {
+		if !errors.Is(err, fs.ErrNotExist) {
 			break // we ran, must be a real error
 		}
 	}
@@ -755,14 +710,14 @@ func loadFile(filename string) (found bool, content []byte, err error) {
 	found = true
 	// get rid of extra new lines and whitespace
 	content = bytes.TrimSpace(content)
-	content = bytes.Replace(content, []byte("\n\n"), []byte("\n"), -1)
+	content = bytes.ReplaceAll(content, []byte("\n\n"), []byte("\n"))
 	return
 }
 
 func diffBytes(content []byte, dir string, sectionName string) (diff string, err error) {
 	section := getSection(content, sectionName)
 	section = bytes.TrimSpace(section)
-	section = bytes.Replace(section, []byte("\n\n"), []byte("\n"), -1)
+	section = bytes.ReplaceAll(section, []byte("\n\n"), []byte("\n"))
 
 	foundOnDisc, sectionFromFile, err := loadFile(filepath.Join(dir, sectionName))
 	if err != nil { // file exists but unable to read
@@ -811,8 +766,7 @@ func (s *Script) diffEmbedded() (err error) {
 	}
 
 	if diff1 != "" || diff2 != "" || diff3 != "" || diff4 != "" {
-		_, _ = fmt.Fprintln(os.Stderr, "Diffs found")
-		os.Exit(1)
+		return errors.New("diffs found")
 	}
 	return
 }
@@ -886,7 +840,7 @@ func (s *Script) extractIfMissingEmbedded() (err error) {
 	}
 
 	if !foundModOnDisc && !foundSumOnDisc && !foundWorkOnDisc && !foundWorkSumOnDisc {
-		s.extractEmbedded()
+		err = s.extractEmbedded()
 	}
 	return
 }
@@ -989,7 +943,7 @@ func getSection(content []byte, sectionName string) (section []byte) {
 		}
 		return []byte(sectionString)
 	}
-	return []byte("")
+	return nil
 }
 
 // removeSection removes a commented section from the contents of the entire file, returning the new contents and where it was removed from
@@ -1011,8 +965,7 @@ func writeFileFromComments(content []byte, sectionName string, file string) (wri
 	if len(section) > 0 {
 		err = os.WriteFile(file, section, 0600)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "Failed to write "+sectionName+" to "+file)
-			return
+			return false, fmt.Errorf("writing %v: %w", sectionName, err)
 		}
 		written = true
 	}

@@ -50,12 +50,12 @@ Note, now this is now just a standard go file, keeping the go tools and the IDEs
 ## Features
 gorun will:
 
-  * write files under a safe directory (e.g. /tmp), so that the actual script location isn't touched (may be read-only)
+  * write files under a safe directory (/var/tmp by default, or as configured), so that the actual script location isn't touched (may be read-only)
   * avoid races between parallel executions of the same file
   * automatically clean up old compiled files that remain unused for some time
   * replace the process rather than using a child
   * pass arguments to the compiled application properly
-  * handle well GOROOT, GOROOT_FINAL and the location of the toolchain
+  * locate the toolchain via /etc/gorun.conf, the PATH, or the well-known install location
   * support embedded go.mod, go.sum and environment variables used for compiling to ensure a repeatable build
   * support more complex projects with multiple source files, all under a common executable directory (e.g. /usr/local/bin)
 
@@ -87,7 +87,8 @@ Note how the second run is significantly faster than the first one. This happens
 gorun will correctly recompile the file whenever necessary.
 
 ## Where are the compiled files kept?
-By default they are kept under /tmp/gorun-<HOST>-<UID>, a directory named after the hostname and user id executing the file.
+By default they are kept under /var/tmp/gorun-<HOST>-<UID>, a directory named after the hostname and user id
+executing the file; /etc/gorun.conf can move this (target_dir_base), e.g. under /var/cache/gorun.
 
 You can remove these files, but there's no reason to do this. These compiled files will be garbage collected by gorun itself after a while once they stop being used.
 
@@ -98,6 +99,21 @@ The vcs build info is not included if the source file is specified in ```go buil
 The -trimpath option is used to prevent the build GOROOT env from being embedded in the binary and potential being used to
 find the go toolchain.
 
+
+## Site configuration (/etc/gorun.conf)
+
+gorun optionally reads /etc/gorun.conf (see the [example](example/linux/etc/gorun.conf)):
+flat key=value lines setting go_bin (toolchain path), cache_base (per-uid build/module
+caches), target_dir_base (compiled binaries), clean_days, and uppercase KEY=VALUE
+build-environment defaults. The file must be owned by root and not group/world writable;
+a file that is present but invalid is a hard error, a missing file means built-in
+defaults. Precedence: command-line flags > embedded go.env section > /etc/gorun.conf >
+built-in defaults (GORUN_ARGS is ignored while /etc/gorun.conf exists).
+
+gorun builds with GOTOOLCHAIN=local and GOENV=off by default, forces GOCACHE/GOMODCACHE
+to its managed per-uid cache location, and never modifies HOME - so ~/.netrc and git
+credentials keep working for private module fetches, and a leaked GOPATH/GOCACHE from
+another user cannot redirect a build.
 
 ## Example usage
 We store go "scripts" in a configuration management repo that is deployed to VMs as required directly in to
@@ -114,7 +130,10 @@ There are multiple ways of making the "script" executable. The simplest is to ad
 top of the file
 
 It is convenient to not have to have a shebang at the top of the file (it doesn't compile!). If running on Linux,
-binfmt_misc can be used to instruct the kernel how to deal with executable programs - see [gorun-register.sh](./example/linux/usr/local/bin/gorun-register.sh)
+binfmt_misc can be used to instruct the kernel how to deal with executable programs - install
+[gorun.conf](./example/linux/etc/binfmt.d/gorun.conf) as /etc/binfmt.d/gorun.conf and run
+```systemctl restart systemd-binfmt``` (systemd's built-in systemd-binfmt.service applies /etc/binfmt.d/
+at boot, so the registrations survive reboots).
 This allows the file to just be a standard go file (no shebang) or to have a special first line comment.
 
 The first line comment of "///bin/env gorun" is useful where the script file name cannot end in ".go", e.g.
@@ -195,9 +214,13 @@ To do that, go.work files can be added to the scripts that references the desire
 
 ## Gotchas
 
-1. To run a script as nobody, normally go build would fail as it couldn't download its dependencies etc. without a valid
-$HOME. This is checked for and HOME is set to a per user run directory (by default under /tmp). This does mean that any
-time the script needs compiled then it will download all dependencies again, and delete them straight after the build.
+1. gorun manages its own persistent per-user Go build and module caches (under
+<cache_base>/<uid>/ when /etc/gorun.conf sets cache_base, otherwise under
+/var/tmp/gorun-<host>-<uid>/). Scripts therefore compile the same way for root, normal
+users, nobody, and users without a home directory - HOME is never modified, and
+recompiles do not re-download dependencies. Inherited GOPATH/GOCACHE/GOMODCACHE/
+XDG_CACHE_HOME are ignored for cache placement; use the embedded go.env section for
+per-script overrides.
 
 ## License
 
