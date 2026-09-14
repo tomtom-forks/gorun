@@ -150,6 +150,14 @@ func main() {
 		Usage()
 		os.Exit(1)
 	}
+	// when running, extra arguments belong to the script; the embed/extract/diff modes
+	// act on exactly one script file, so extra arguments there are almost certainly a
+	// shell glob that matched more than intended (e.g. dir/*.go picking up _test.go files)
+	if (diff || embed || extract || extractIfMissing) && flag.NArg() > 1 {
+		_, _ = fmt.Fprintf(os.Stderr, "error: -diff/-embed/-extract/-extractIfMissing take a single script file, got %v: %v\n",
+			flag.NArg(), strings.Join(flag.Args(), " "))
+		os.Exit(1)
+	}
 
 	s.args = flag.Args()
 	s.cleanSecs = cleanDays * 24 * 3600

@@ -336,9 +336,9 @@ the config should only ever *narrow* behaviour, never be required.
 
 ## Supplementary tasks
 
-1. In gorun — in `-embed`/`-extract`/`-extractIfMissing`/`-diff` mode, error out (or at
-   least warn) when more than one argument is left after flag parsing, since extra file
-   arguments can't mean anything there. Today only `flag.Arg(0)` is used
+1. *(done 2026-09-14)* In gorun — in `-embed`/`-extract`/`-extractIfMissing`/`-diff`
+   mode, error out (or at least warn) when more than one argument is left after flag
+   parsing, since extra file arguments can't mean anything there. Today only `flag.Arg(0)` is used
    (`gorun.go:137`) and the rest are silently ignored, so a shell glob like
    `gorun -embed dir/*.go` can operate on the wrong file (e.g. a `_test.go` file,
    depending on locale collation order) without any indication.

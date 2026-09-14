@@ -187,6 +187,13 @@ Every other caller of the changed functions was traced to `main()`'s error handl
 
 Matrix: **17 cases, 0 failed checks.**
 
+## Supplementary task 1 — refuse extra arguments in embed/extract/diff modes (2026-09-14)
+
+`-diff`/`-embed`/`-extract`/`-extractIfMissing` now exit 1 with an error naming the extra
+arguments when `flag.NArg() > 1`, instead of silently operating on `flag.Arg(0)`. This
+is what let `gorun -embed dir/*.go` embed into `rundeckHandoverAPI_test.go` under
+en_GB.UTF-8 collation. Run mode is unchanged: extra arguments are the script's argv.
+
 ## Result
 
 All seven changes from `go-env-review.md` implemented on `origin/master` (`e0c4727`),
