@@ -164,6 +164,29 @@ redundant `.Local()`. `modernize ./...` now reports nothing.
 
 Matrix: **17 cases, 0 failed checks.**
 
+## Follow-up — error reporting fixes in pre-existing code (2026-09-14)
+
+Behaviour changes, all in how failures are reported: errors are returned wrapped
+(`%w`) instead of being printed to *stdout* and then also returned (`updateTarget`,
+`runCommand`, `copyDir`, `writeFileFromComments`), so each failure is reported once, on
+stderr, with its cause chain; `main()` only adds "failed to find compiled binary" when
+the error really is a missing binary (`fs.ErrNotExist`) rather than to every `runScript`
+failure; "no script given" is detected with `flag.NArg() == 0` instead of comparing token
+and flag counts (which let `gorun -cleanDays 3` through), and an unresolvable source
+path now reports on stderr and exits 1 (was stdout, exit 0); `diffEmbedded` returns an
+error instead of calling `os.Exit`; `copyDir` checks the `filepath.Rel` and `os.Mkdir`
+results it used to ignore; `clean()` no longer dereferences a nil `FileInfo` when
+`.lastRun` fails to stat for a reason other than not existing; the debug "lower active
+build" message goes to stderr like the other debug output; `extractIfMissingEmbedded`
+propagates the error from `extractEmbedded` instead of discarding it (previously masked
+by the print inside `writeFileFromComments` — the message appeared but gorun exited 0);
+likewise `writeFileFromCommentsOrDir` no longer discards `copyDir`'s result — a missing
+on-disk `go.mod`/`go.sum`/`go.work` is still fine (they are optional), but an unreadable
+or uncopyable one is now reported instead of surfacing as a confusing `go build` failure.
+Every other caller of the changed functions was traced to `main()`'s error handler.
+
+Matrix: **17 cases, 0 failed checks.**
+
 ## Result
 
 All seven changes from `go-env-review.md` implemented on `origin/master` (`e0c4727`),

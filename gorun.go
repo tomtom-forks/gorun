@@ -145,7 +145,8 @@ func main() {
 		os.Exit(0)
 	}
 
-	if len(args) == flag.NFlag() {
+	// no positional argument left after the flags means no script file was given
+	if flag.NArg() == 0 {
 		Usage()
 		os.Exit(1)
 	}
@@ -156,8 +157,8 @@ func main() {
 
 	sourceFile, err := realPath(flag.Arg(0))
 	if err != nil {
-		fmt.Printf("Failed to find source file %v\n", err.Error())
-		return
+		_, _ = fmt.Fprintf(os.Stderr, "error: failed to find source file: %v\n", err)
+		os.Exit(1)
 	}
 	s.scriptPath = sourceFile
 
@@ -171,8 +172,10 @@ func main() {
 		err = s.embedEmbedded()
 	} else {
 		err = s.runScript()
-		if err != nil {
-			err = errors.New("running script failed to find compiled binary: " + err.Error())
+		if errors.Is(err, fs.ErrNotExist) {
+			// runScript retries when the binary vanishes underneath it; only this case
+			// is about the binary - other errors already say what went wrong
+			err = fmt.Errorf("running script failed to find compiled binary: %w", err)
 		}
 	}
 	if err != nil {
@@ -242,38 +245,36 @@ func (s *Script) initVars() (err error) {
 	return
 }
 
-// simplistic copy files from one directory to another, deleting files that no longer exist
-// given /tmp/path/<goscript>_ directory as dstDir and /path/<goscript>_ directory as srcDir
+// copyDir copies the regular files and directories under srcDir to dstDir (it does not
+// remove anything already in dstDir), e.g. /path/<goscript>_ to /var/tmp/.../<goscript>_
 func copyDir(dstDir string, srcDir string) (err error) {
-	err = filepath.WalkDir(srcDir, func(srcPath string, d fs.DirEntry, err error) error {
+	return filepath.WalkDir(srcDir, func(srcPath string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		relPath, err := filepath.Rel(srcDir, srcPath)
+		if err != nil {
+			return err
+		}
+		dstPath := filepath.Join(dstDir, relPath)
 		switch d.Type() {
-		case 0: // Regular file
+		case 0: // Regular file - the os errors already name the operation and path
 			content, err := os.ReadFile(srcPath)
 			if err != nil {
-				fmt.Fprintln(os.Stderr, "Failed to read (while copying) "+relPath+" to "+dstDir)
 				return err
 			}
-			err = os.WriteFile(filepath.Join(dstDir, relPath), content, 0600)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "Failed to write (while copying) "+relPath+" to "+dstDir)
+			if err = os.WriteFile(dstPath, content, 0600); err != nil {
 				return err
 			}
 		case os.ModeDir:
-			os.Mkdir(filepath.Join(dstDir, relPath), 0700)
-			return nil
+			if err = os.Mkdir(dstPath, 0700); err != nil && !errors.Is(err, fs.ErrExist) {
+				return err
+			}
 		default:
-			return fmt.Errorf("We only handle regular files, not %s", relPath)
+			return fmt.Errorf("only regular files can be copied, not %v", relPath)
 		}
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-	return
 }
 
 // writeFileFromCommentsOrDir uses either the parsed commented section or the file on disc and copies it to the target dir
@@ -284,7 +285,12 @@ func (s *Script) writeFileFromCommentsOrDir(content []byte, sectionName string) 
 		return
 	}
 	if !written {
-		_ = copyDir(filepath.Join(s.perRunTmpDir, sectionName), filepath.Join(filepath.Dir(s.scriptPath), sectionName))
+		// no embedded section: use the file beside the script if there is one. These files
+		// are optional, so a missing one is not an error - anything else is
+		err = copyDir(filepath.Join(s.perRunTmpDir, sectionName), filepath.Join(filepath.Dir(s.scriptPath), sectionName))
+		if errors.Is(err, fs.ErrNotExist) {
+			err = nil
+		}
 	}
 	return
 }
@@ -294,8 +300,7 @@ func (s *Script) updateTarget() (err error) {
 	os.RemoveAll(s.perRunTmpDirBase) // just in case it still exists
 	err = os.MkdirAll(s.perRunTmpDirBase, 0700)
 	if err != nil {
-		fmt.Printf("Failed to mkdirAll for %v. %v\n", s.perRunTmpDirBase, err.Error())
-		return
+		return fmt.Errorf("creating build dir: %w", err)
 	}
 
 	var checkDirs []string
@@ -308,13 +313,11 @@ func (s *Script) updateTarget() (err error) {
 		dest := filepath.Join(s.perRunTmpDirBase, dir)
 		err = os.MkdirAll(dest, 0700)
 		if err != nil {
-			fmt.Printf("Failed to mkdirAll on %v. %v\n", dest, err.Error())
-			return
+			return fmt.Errorf("creating build dir: %w", err)
 		}
 
 		err = copyDir(dest, src)
 		if err != nil {
-			fmt.Printf("Failed to copyDir %v\n", err.Error())
 			return
 		}
 	}
@@ -331,8 +334,7 @@ func (s *Script) updateTarget() (err error) {
 	}
 	err = os.MkdirAll(filepath.Dir(dstScriptPath), 0700)
 	if err != nil {
-		fmt.Printf("Failed to mkdirAll for %v. %v\n", filepath.Dir(dstScriptPath), err.Error())
-		return
+		return fmt.Errorf("creating build dir: %w", err)
 	}
 	err = os.WriteFile(dstScriptPath, s.content, 0600)
 	if err != nil {
@@ -371,7 +373,7 @@ func runCommand(dir string, env []string, command string, args ...string) (err e
 	cmd.Env = env
 	err = cmd.Run()
 	if err != nil {
-		fmt.Printf("Run command %v %v failed with %s\n", command, args, err)
+		return fmt.Errorf("%v %v: %w", command, strings.Join(args, " "), err)
 	}
 	return
 }
@@ -446,7 +448,7 @@ func (s *Script) hasActiveBuild() bool {
 				if pid != currentPID && isProcessRunning(pid) {
 					if pid < currentPID {
 						if s.debug {
-							_, _ = fmt.Fprintf(os.Stdout, "[%v] Detected lower active build process with PID %d\n", currentPID, pid)
+							_, _ = fmt.Fprintf(os.Stderr, "[%v] Detected lower active build process with PID %d\n", currentPID, pid)
 						}
 						return true
 					}
@@ -540,7 +542,7 @@ func (s *Script) clean() (err error) {
 
 			// Check and clean the binary if it hasn't been accessed recently
 			st, err := os.Stat(filepath.Join(scriptDir, ".lastRun"))
-			if !errors.Is(err, fs.ErrNotExist) && st.ModTime().Before(cutoffTime) {
+			if err == nil && st.ModTime().Before(cutoffTime) {
 				os.RemoveAll(scriptDir)
 				continue // Directory removed, skip build dir cleanup
 			}
@@ -756,8 +758,7 @@ func (s *Script) diffEmbedded() (err error) {
 	}
 
 	if diff1 != "" || diff2 != "" || diff3 != "" || diff4 != "" {
-		_, _ = fmt.Fprintln(os.Stderr, "Diffs found")
-		os.Exit(1)
+		return errors.New("diffs found")
 	}
 	return
 }
@@ -831,7 +832,7 @@ func (s *Script) extractIfMissingEmbedded() (err error) {
 	}
 
 	if !foundModOnDisc && !foundSumOnDisc && !foundWorkOnDisc && !foundWorkSumOnDisc {
-		s.extractEmbedded()
+		err = s.extractEmbedded()
 	}
 	return
 }
@@ -956,8 +957,7 @@ func writeFileFromComments(content []byte, sectionName string, file string) (wri
 	if len(section) > 0 {
 		err = os.WriteFile(file, section, 0600)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "Failed to write "+sectionName+" to "+file)
-			return
+			return false, fmt.Errorf("writing %v: %w", sectionName, err)
 		}
 		written = true
 	}
