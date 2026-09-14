@@ -152,6 +152,18 @@ ownership problem. envmatrix README finalised: "Current" column renamed "Pre-fix
 Matrix: **17 cases, 0 failed checks** — gorun refused the squatted target directory
 ("owned by uid 1001, not uid 0 - refusing to use it"), no binary written.
 
+## Follow-up — mechanical modernisation of pre-existing code (2026-09-14)
+
+No behaviour change; brings upstream idioms in `gorun.go` up to the module's Go 1.24
+level, as flagged by `gofmt -s`/`go vet ./...`/gopls `modernize` and a manual pass:
+range-over-int loops, `min()` for the backoff cap, `errors.Is(err, fs.ErrNotExist)` for
+`os.IsNotExist`, `filepath.WalkDir` for `filepath.Walk`, `os.ReadDir` in `clean()` (which
+also closes the directory handle the old `os.Open`+`Readdir` never released),
+`bytes.ReplaceAll`, `getSection` returning `nil`, `var checkDirs []string`, and no
+redundant `.Local()`. `modernize ./...` now reports nothing.
+
+Matrix: **17 cases, 0 failed checks.**
+
 ## Result
 
 All seven changes from `go-env-review.md` implemented on `origin/master` (`e0c4727`),

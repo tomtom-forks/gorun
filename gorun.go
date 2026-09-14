@@ -18,6 +18,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -244,12 +245,12 @@ func (s *Script) initVars() (err error) {
 // simplistic copy files from one directory to another, deleting files that no longer exist
 // given /tmp/path/<goscript>_ directory as dstDir and /path/<goscript>_ directory as srcDir
 func copyDir(dstDir string, srcDir string) (err error) {
-	err = filepath.Walk(srcDir, func(srcPath string, f os.FileInfo, err error) error {
+	err = filepath.WalkDir(srcDir, func(srcPath string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		relPath, err := filepath.Rel(srcDir, srcPath)
-		switch f.Mode() & os.ModeType {
+		switch d.Type() {
 		case 0: // Regular file
 			content, err := os.ReadFile(srcPath)
 			if err != nil {
@@ -297,7 +298,7 @@ func (s *Script) updateTarget() (err error) {
 		return
 	}
 
-	checkDirs := []string{}
+	var checkDirs []string
 	if s.scriptExtraDir != "" {
 		checkDirs = append(checkDirs, s.scriptExtraDir)
 	}
@@ -463,7 +464,7 @@ func (s *Script) waitForActiveBuilds() bool {
 	waitTime := 100 * time.Millisecond
 	maxWaitTime := 2 * time.Second
 
-	for i := 0; i < maxRetries; i++ {
+	for i := range maxRetries {
 		if !s.hasActiveBuild() {
 			return true
 		}
@@ -480,10 +481,7 @@ func (s *Script) waitForActiveBuilds() bool {
 		}
 
 		// Exponential backoff, but cap at maxWaitTime
-		waitTime *= 2
-		if waitTime > maxWaitTime {
-			waitTime = maxWaitTime
-		}
+		waitTime = min(waitTime*2, maxWaitTime)
 	}
 
 	// Timeout occurred, but we'll proceed anyway
@@ -495,14 +493,14 @@ func (s *Script) waitForActiveBuilds() bool {
 
 func touchFile(file string, onlyIfExists bool) (err error) {
 	_, err = os.Stat(file)
-	if os.IsNotExist(err) {
+	if errors.Is(err, fs.ErrNotExist) {
 		if !onlyIfExists {
 			var f *os.File
 			f, err = os.Create(file)
 			defer f.Close()
 		}
 	} else {
-		currentTime := time.Now().Local()
+		currentTime := time.Now()
 		err = os.Chtimes(file, currentTime, currentTime)
 	}
 	return
@@ -522,31 +520,27 @@ func (s *Script) run() (err error) {
 // Check a file in each directory to see when it was last touched (last run)
 // Also remove any per-process build and cache directories that are older than cleanSecsBuildDirs
 func (s *Script) clean() (err error) {
-	perUserDir, err := os.Open(s.perUserTmpDir)
-	if err != nil {
-		return
-	}
-	infos, err := perUserDir.Readdir(-1)
+	entries, err := os.ReadDir(s.perUserTmpDir)
 	if err != nil {
 		return
 	}
 	cutoffTime := time.Now().Add(time.Duration(-s.cleanSecs) * time.Second)
 	buildDirCutoffTime := time.Now().Add(time.Duration(-s.cleanSecsBuildDirs) * time.Second)
 
-	for _, info := range infos {
-		if info.IsDir() {
+	for _, entry := range entries {
+		if entry.IsDir() {
 			// without a configured cache_base the persistent per-uid caches live alongside
 			// the per-script dirs. They are not stale scripts, and the build cache's shard
 			// dirs (00..ff) are numeric - the PID-dir sweep below would prune them - so
 			// skip them before either pass
-			if info.Name() == "gocache" || info.Name() == "gomod" {
+			if entry.Name() == "gocache" || entry.Name() == "gomod" {
 				continue
 			}
-			scriptDir := filepath.Join(s.perUserTmpDir, info.Name())
+			scriptDir := filepath.Join(s.perUserTmpDir, entry.Name())
 
 			// Check and clean the binary if it hasn't been accessed recently
 			st, err := os.Stat(filepath.Join(scriptDir, ".lastRun"))
-			if !os.IsNotExist(err) && st.ModTime().Before(cutoffTime) {
+			if !errors.Is(err, fs.ErrNotExist) && st.ModTime().Before(cutoffTime) {
 				os.RemoveAll(scriptDir)
 				continue // Directory removed, skip build dir cleanup
 			}
@@ -590,15 +584,19 @@ func (s *Script) targetOutOfDate() (outOfDate bool, err error) {
 		return
 	}
 	// if we have any extra source directories, check whether any are newer than the binary.
-	checkDirs := []string{}
+	var checkDirs []string
 	if s.scriptExtraDir != "" {
 		checkDirs = append(checkDirs, s.scriptExtraDir)
 	}
 	checkDirs = append(checkDirs, s.scriptWorkDirs...)
 	for _, checkDir := range checkDirs {
-		err = filepath.Walk(checkDir, func(path string, info os.FileInfo, err error) error {
+		err = filepath.WalkDir(checkDir, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				_, _ = fmt.Fprintf(os.Stderr, "FATAL: Unable to find dependency: %v\n", path)
+				return err
+			}
+			info, err := d.Info()
+			if err != nil {
 				return err
 			}
 			if info.ModTime().After(oldestSrcInfo.ModTime()) {
@@ -654,7 +652,7 @@ func (s *Script) runScript() (err error) {
 	// our feet too. We could also get our directory deleted entirely from under us as part of
 	// a clean up, so let's try multiple times
 	var outOfDate bool
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		outOfDate, err = s.targetOutOfDate()
 		if err != nil {
 			return // can't find the source file - let's bail
@@ -678,7 +676,7 @@ func (s *Script) runScript() (err error) {
 		if !s.noRun {
 			err = s.run()
 		}
-		if !os.IsNotExist(err) {
+		if !errors.Is(err, fs.ErrNotExist) {
 			break // we ran, must be a real error
 		}
 	}
@@ -702,14 +700,14 @@ func loadFile(filename string) (found bool, content []byte, err error) {
 	found = true
 	// get rid of extra new lines and whitespace
 	content = bytes.TrimSpace(content)
-	content = bytes.Replace(content, []byte("\n\n"), []byte("\n"), -1)
+	content = bytes.ReplaceAll(content, []byte("\n\n"), []byte("\n"))
 	return
 }
 
 func diffBytes(content []byte, dir string, sectionName string) (diff string, err error) {
 	section := getSection(content, sectionName)
 	section = bytes.TrimSpace(section)
-	section = bytes.Replace(section, []byte("\n\n"), []byte("\n"), -1)
+	section = bytes.ReplaceAll(section, []byte("\n\n"), []byte("\n"))
 
 	foundOnDisc, sectionFromFile, err := loadFile(filepath.Join(dir, sectionName))
 	if err != nil { // file exists but unable to read
@@ -936,7 +934,7 @@ func getSection(content []byte, sectionName string) (section []byte) {
 		}
 		return []byte(sectionString)
 	}
-	return []byte("")
+	return nil
 }
 
 // removeSection removes a commented section from the contents of the entire file, returning the new contents and where it was removed from
